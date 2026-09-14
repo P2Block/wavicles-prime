@@ -217,8 +217,12 @@ fn d_session_coinbase_budget() -> usize {
 }
 
 impl Config {
-    /// The commit a stock gateway names in its user agent, `v0.4.1-beta/<hex>`; `None` if the
-    /// agent does not carry one.
+    /// The commit a STOCK gateway names in its user agent, `v0.4.1-beta/<hex>`. `None` if the
+    /// agent carries no commit, or carries one with a suffix (`<hex>+`, `<hex>-dirty`): that is
+    /// a locally modified tree, and the commit alone no longer says what the binary does -- the
+    /// house gateways are exactly that, b9ea7dc3 plus a local 164-byte header fix, and they pay
+    /// every split. A modified build is neither refused nor trusted by commit; it is judged
+    /// like any other by what its coinbases actually pay.
     pub fn ua_commit(ua: &str) -> Option<&str> {
         let (_, rest) = ua.rsplit_once('/')?;
         let hex = rest.trim();
@@ -331,6 +335,9 @@ mod tests {
         assert_eq!(c.rejected_build("v0.4.1-beta/B9EA7DC3EB91"), Some("b9ea7dc3"), "case-insensitive on the agent");
         assert_eq!(c.rejected_build("no-commit-here"), None);
         assert_eq!(Config::ua_commit("v0.4.1-beta/"), None);
+        assert_eq!(c.rejected_build("v0.4.1-beta/b9ea7dc3eb91352565ab487ec55ed6ee5964a440+"), None,
+            "a modified tree (+) is not judged by its base commit: the house gateways are one");
+        assert_eq!(c.rejected_build("v0.4.1-beta/b9ea7dc3eb91-dirty"), None);
         c.reject_gateway_builds.clear();
         assert_eq!(c.rejected_build(bad), None, "empty list refuses nothing");
         assert!(d_reject_gateway_message().len() < 511);

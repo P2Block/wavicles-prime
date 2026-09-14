@@ -166,8 +166,13 @@ pub async fn run(shared: Arc<Shared>, mut stream: TcpStream, remote: SocketAddr)
     // A build on the refuse list gets the notice as its MOTD -- stock gateways log it -- and
     // nothing else: no configure, no work, no row in the clients table. It will retry and read
     // the same notice each time until it updates.
-    if let Some(bad) = shared.cfg.rejected_build(&hello.user_agent) {
-        let gateway_hex = hex::encode(&hello.identity_sign_pk[..8]);
+    // House gateways are never refused by build: they are ours, patched, and answer for their
+    // coinbases with 0 partial splits on record. (Their agent also carries a '+' suffix that
+    // `ua_commit` already declines to judge; this makes the exemption deliberate, not incidental.)
+    let gateway_hex_early = hex::encode(&hello.identity_sign_pk[..8]);
+    let is_house = house_stratum(&shared.cfg, remote, &gateway_hex_early);
+    if let Some(bad) = shared.cfg.rejected_build(&hello.user_agent).filter(|_| !is_house) {
+        let gateway_hex = gateway_hex_early;
         log::warn!(
             "[{id}] {remote} hello ua={:?} gateway={gateway_hex}: build refused (matches {bad:?}); notice sent as MOTD",
             hello.user_agent
