@@ -74,6 +74,8 @@ pub struct Totals {
     pub block_candidates: AtomicU64,
     pub blocks_submitted: AtomicU64,
     pub handshake_failures: AtomicU64,
+    /// Hellos turned away by `reject-gateway-builds`.
+    pub builds_rejected: AtomicU64,
     /// Accepts turned away at the connection limits.
     pub connections_refused: AtomicU64,
 }

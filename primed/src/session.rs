@@ -163,6 +163,24 @@ pub async fn run(shared: Arc<Shared>, mut stream: TcpStream, remote: SocketAddr)
     let (send_nonce, recv_nonce) = crypto::session_nonces(hello.seed, &hello.session_sign_pk);
     let channel = Channel::new(session_key.precompute(&hello.session_box_pk), send_nonce, recv_nonce);
 
+    // A build on the refuse list gets the notice as its MOTD -- stock gateways log it -- and
+    // nothing else: no configure, no work, no row in the clients table. It will retry and read
+    // the same notice each time until it updates.
+    if let Some(bad) = shared.cfg.rejected_build(&hello.user_agent) {
+        let gateway_hex = hex::encode(&hello.identity_sign_pk[..8]);
+        log::warn!(
+            "[{id}] {remote} hello ua={:?} gateway={gateway_hex}: build refused (matches {bad:?}); notice sent as MOTD",
+            hello.user_agent
+        );
+        shared.totals.add(&shared.totals.builds_rejected, 1);
+        let reply = handshake::build_server_hello(&shared.pool, &session_key, &hello, &shared.cfg.reject_gateway_message);
+        let mut h = Header::new(cmd::HELLO_REPLY, reply.len());
+        h.sealed = true;
+        h.signed = true;
+        write_frame(&mut stream, &h, &reply, &mut send_keys).await?;
+        return Err(SessionError::Bad("gateway build refused"));
+    }
+
     let reply = handshake::build_server_hello(&shared.pool, &session_key, &hello, &shared.cfg.motd);
     let mut h = Header::new(cmd::HELLO_REPLY, reply.len());
     h.sealed = true;

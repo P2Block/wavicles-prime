@@ -24,6 +24,20 @@ pub struct Config {
     pub key_file: Option<PathBuf>,
     #[serde(default = "d_motd")]
     pub motd: String,
+    /// Gateway builds refused at the hello, as lowercase hex prefixes of the commit a stock
+    /// gateway names in its user agent (`v0.4.1-beta/<commit>`). A refused gateway is sent
+    /// `reject-gateway-message` as the MOTD of the server hello -- stock gateways log it as
+    /// "DATUM Server MOTD" -- and the session closes before any work is exchanged. Empty
+    /// refuses nothing. Why it exists (2026-09-14): the 2026-09-03 build (b9ea7dc3) miscounts
+    /// the BLAKE2b coinbase bytes and truncates every split it is issued, so a block it found
+    /// would leave most of the TIDES window unpaid while its own identity kept earning from
+    /// everyone else's blocks. Fixed upstream on 2026-09-05 (7491a509).
+    #[serde(default)]
+    pub reject_gateway_builds: Vec<String>,
+    /// Sent as the MOTD to a refused gateway. Keep it under 511 bytes: that is the gateway's
+    /// MOTD buffer.
+    #[serde(default = "d_reject_gateway_message")]
+    pub reject_gateway_message: String,
     /// Address the pool's remainder and fee go to. Also the address gateways are configured with.
     pub payout_address: String,
     #[serde(default = "d_tag")]
@@ -140,6 +154,13 @@ fn d_listen() -> SocketAddr {
 fn d_stats_listen() -> SocketAddr {
     "127.0.0.1:28916".parse().unwrap()
 }
+fn d_reject_gateway_message() -> String {
+    "This gateway build is refused: it miscounts the BLAKE2b coinbase bytes and truncates the \
+     payout list, so a block it found would leave most of the window unpaid. Update your DATUM \
+     gateway to a build from 2026-09-05 or later (commit 7491a509 onward) and reconnect; your \
+     address keeps its standing in the window."
+        .into()
+}
 fn d_motd() -> String {
     "Lazarus".into()
 }
@@ -196,6 +217,21 @@ fn d_session_coinbase_budget() -> usize {
 }
 
 impl Config {
+    /// The commit a stock gateway names in its user agent, `v0.4.1-beta/<hex>`; `None` if the
+    /// agent does not carry one.
+    pub fn ua_commit(ua: &str) -> Option<&str> {
+        let (_, rest) = ua.rsplit_once('/')?;
+        let hex = rest.trim();
+        (hex.len() >= 7 && hex.chars().all(|c| c.is_ascii_hexdigit())).then_some(hex)
+    }
+    /// The `reject-gateway-builds` prefix this user agent matches, if any.
+    pub fn rejected_build(&self, ua: &str) -> Option<&str> {
+        let commit = Self::ua_commit(ua)?.to_ascii_lowercase();
+        self.reject_gateway_builds
+            .iter()
+            .map(String::as_str)
+            .find(|p| !p.is_empty() && commit.starts_with(&p.to_ascii_lowercase()))
+    }
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut c: Config = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -256,6 +292,15 @@ impl Config {
         if let Some(mode) = &self.verify_shares {
             v.push(format!("verify-shares = {mode:?} is ignored: shares are always verified and the coinbase is always checked against the issued TIDES split"));
         }
+        for p in &self.reject_gateway_builds {
+            let ok = p.len() >= 7 && p.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase());
+            if !ok {
+                v.push(format!("reject-gateway-builds entry {p:?} is not a lowercase hex commit prefix of at least 7 chars; it will never match"));
+            }
+        }
+        if self.reject_gateway_message.len() > 511 {
+            v.push("reject-gateway-message is longer than the gateway's 511-byte MOTD buffer; it will be cut".into());
+        }
         if self.require_split_gateway.is_some() {
             v.push("require-split-gateway is ignored: stock DATUM gateways pay the split from the coinbaser reply, so none need a patched user agent".into());
         }
@@ -274,6 +319,22 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refuses_only_the_listed_build() {
+        let mut c: Config = toml::from_str(LEGACY).unwrap();
+        c.reject_gateway_builds = vec!["b9ea7dc3".into()];
+        let bad = "v0.4.1-beta/b9ea7dc3eb91352565ab487ec55ed6ee5964a440";
+        let good = "v0.4.1-beta/7491a5099dd5d887a027c812f71d";
+        assert_eq!(c.rejected_build(bad), Some("b9ea7dc3"));
+        assert_eq!(c.rejected_build(good), None);
+        assert_eq!(c.rejected_build("v0.4.1-beta/B9EA7DC3EB91"), Some("b9ea7dc3"), "case-insensitive on the agent");
+        assert_eq!(c.rejected_build("no-commit-here"), None);
+        assert_eq!(Config::ua_commit("v0.4.1-beta/"), None);
+        c.reject_gateway_builds.clear();
+        assert_eq!(c.rejected_build(bad), None, "empty list refuses nothing");
+        assert!(d_reject_gateway_message().len() < 511);
+    }
 
     /// The file the previous Prime shipped, minus the placeholder address.
     const LEGACY: &str = r#"

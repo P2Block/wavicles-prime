@@ -190,6 +190,7 @@ pub fn build(shared: &Shared) -> Value {
             "connections": t.connections.load(Ordering::Relaxed),
             "connections_refused": t.connections_refused.load(Ordering::Relaxed),
             "handshake_failures": t.handshake_failures.load(Ordering::Relaxed),
+            "builds_rejected": t.builds_rejected.load(Ordering::Relaxed),
             "seen_shares": seen_shares,
             "seen_heights": seen_heights,
         },
