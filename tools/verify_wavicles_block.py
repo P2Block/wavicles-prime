@@ -23,18 +23,27 @@ def recompute(snap):
     """Return (problems, payees[(identity, sats, script_hex)], pool_sats) from the snapshot's inputs."""
     problems = []
     p = snap["params"]; fee_bps = int(p["fee_bps"]); min_payout = int(p["min_payout"])
+    stratum_bps = int(p.get("stratum_fee_bps", 0) or 0) or fee_bps
+    # snapshot v2 (P2Block): params.fee_overrides = [{identity, fee_bps}] overrides both paths for that identity
+    overrides = {o["identity"]: int(o["fee_bps"]) for o in p.get("fee_overrides", [])}
+    def bps_for(identity):
+        o = overrides.get(identity)
+        return (o, o) if o is not None else (stratum_bps, fee_bps)   # (stratum bps, datum bps)
     value = int(snap["coinbase_value"]); ids = snap["window"]["identities"]
     total_work = sum(int(i["work"]) for i in ids)
     if total_work != int(snap["window"]["total_work"]):
         problems.append(f"window total_work {snap['window']['total_work']} != sum of identities {total_work}")
     script_of = {q["identity"]: q["script"] for q in snap["split"]["payees"]}
     miners = sorted(ids, key=lambda m: (-int(m["work"]), m["identity"]))
-    payees = []; paid = 0; fee = 0
+    payees = []; paid = 0; fee = 0; fee_num = 0
     if total_work > 0:
         for m in miners:
-            w = int(m["work"])
-            sats = value * w * (10000 - fee_bps) // total_work // 10000
-            fee += value * w * fee_bps // total_work // 10000
+            w = int(m["work"]); sw = min(int(m.get("stratum_work", 0)), w); dw = w - sw
+            sbps, dbps = bps_for(m["identity"])
+            fee_num += sw * sbps + dw * dbps
+            keep = sw * (10000 - sbps) + dw * (10000 - dbps)
+            sats = value * keep // total_work // 10000
+            fee += value * (sw * sbps + dw * dbps) // total_work // 10000
             if sats == 0: continue
             if sats < min_payout: continue  # unpaid: BelowMinimum
             if m["identity"] not in script_of: continue  # NoScript / OverBudget — listed in split.unpaid
@@ -44,9 +53,7 @@ def recompute(snap):
     max_payees = int(p.get("max_payees", 0) or 0)
     if max_payees > 0 and payees:
         ids_by = {i["identity"]: int(i["work"]) for i in ids}
-        sw_all = sum(int(i.get("stratum_work", 0)) for i in ids); dw_all = total_work - sw_all
-        sbps = int(p.get("stratum_fee_bps", 0) or 0) or fee_bps
-        fee = value * (sw_all * sbps + dw_all * fee_bps) // max(total_work, 1) // 10000
+        fee = value * fee_num // max(total_work, 1) // 10000   # exact, per-identity bps
         payees.sort(key=lambda q: (-ids_by[q[0]], q[0]))
         payees = payees[:max_payees]
         distributable = value - fee; kept_work = sum(ids_by[q[0]] for q in payees)
@@ -134,7 +141,7 @@ def main():
         print(f"OK snapshot was computed on this block's parent" + (f" (height noted {snap['height']}, block {a.height})" if snap["height"] != a.height else ""))
     problems, payees, pool_sats = recompute(snap)
     for p in problems: print("FAIL", p); ok = False
-    if not problems: print(f"OK TIDES split ({len(payees)} payees, fee {snap['params']['fee_bps']} bps, carry paid {sum(x['sats'] for x in snap['split']['carry_paid'])} sats) reproduces from the committed window")
+    if not problems: print(f"OK TIDES split ({len(payees)} payees, fee {snap['params']['fee_bps']}/{snap['params'].get('stratum_fee_bps', 0)} bps, {len(snap['params'].get('fee_overrides', []))} overrides, carry paid {sum(x['sats'] for x in snap['split']['carry_paid'])} sats) reproduces from the committed window")
     total = sum(round(o["value"] * 1e8) for o in cb["vout"])
     scale = total / int(snap["coinbase_value"]) if int(snap["coinbase_value"]) else 1.0
     missing = []

@@ -171,9 +171,7 @@ impl Window {
         t.0 = t.0.saturating_add(work);
         t.2 = ts;
         let appended = match self.credits.back_mut() {
-            Some(tail)
-                if tail.ident == ident && tail.ts == ts && tail.height == height && tail.source == source =>
-            {
+            Some(tail) if tail.ident == ident && tail.ts == ts && tail.height == height && tail.source == source => {
                 tail.work = tail.work.saturating_add(work);
                 false
             }
@@ -757,8 +755,7 @@ mod tests {
                 l.credit(if i % 5 == 0 { "slow" } else { "fast" }, 40, 1, 1000 + i, SOURCE_DATUM).unwrap();
             }
             l.persist_window().unwrap();
-            let miners: Vec<(String, u64)> =
-                l.window.miners().into_iter().map(|m| (m.identity, m.work)).collect();
+            let miners: Vec<(String, u64)> = l.window.miners().into_iter().map(|m| (m.identity, m.work)).collect();
             let file_rows = fs::metadata(dir.join("credits.bin")).unwrap().len() as usize / Credit::SIZE;
             assert_eq!(file_rows, l.window.len(), "credits.bin must be exactly the live window");
             (l.window.total_work(), l.window.len(), miners)
@@ -792,15 +789,13 @@ mod tests {
                 }
             }
             l.flush().unwrap();
-            let mut m: Vec<(String, u64)> =
-                l.window.miners().into_iter().map(|x| (x.identity, x.work)).collect();
+            let mut m: Vec<(String, u64)> = l.window.miners().into_iter().map(|x| (x.identity, x.work)).collect();
             m.sort();
             assert_eq!(m.iter().map(|x| x.1).sum::<u64>(), l.window.total_work());
             m
         };
         let l = Ledger::open(&dir).unwrap();
-        let mut after: Vec<(String, u64)> =
-            l.window.miners().into_iter().map(|x| (x.identity, x.work)).collect();
+        let mut after: Vec<(String, u64)> = l.window.miners().into_iter().map(|x| (x.identity, x.work)).collect();
         after.sort();
         assert_eq!(after, before, "per-miner work must be identical after reload");
         let _ = fs::remove_dir_all(&dir);
@@ -844,7 +839,10 @@ mod tests {
             settled: true,
             submit: "accepted".into(),
             gateway: "ab".into(),
-                    unpaid: vec![], carry_paid: vec![], snapshot: String::new(), carried: false,
+            unpaid: vec![],
+            carry_paid: vec![],
+            snapshot: String::new(),
+            carried: false,
         };
         log.append(&r).unwrap();
         assert_eq!(log.read_all().unwrap(), vec![r.clone()]);

@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use datum_wire::cmd;
 use datum_wire::coinbase::{self, TxOut};
 use datum_wire::crypto::{self, Channel, Identity};
 use datum_wire::frame::{Header, KeyStream, CLIENT_INITIAL_KEY};
@@ -24,7 +25,6 @@ use datum_wire::handshake;
 use datum_wire::mining::{self, Blake2bSection, CoinbaseSection, JobSection, PowSubmit};
 use datum_wire::pow::{self, Hash};
 use datum_wire::verify::{job_work_for, JobSlot};
-use datum_wire::cmd;
 
 const HEIGHT: u32 = 966_267;
 const VALUE: u64 = 312_538_966;
@@ -89,7 +89,11 @@ poll = 5.0
         if TcpStream::connect(("127.0.0.1", listen)).is_ok() {
             break;
         }
-        assert!(Instant::now() < deadline, "primed did not start: {}", std::fs::read_to_string(p.dir.join("primed.err")).unwrap_or_default());
+        assert!(
+            Instant::now() < deadline,
+            "primed did not start: {}",
+            std::fs::read_to_string(p.dir.join("primed.err")).unwrap_or_default()
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
     (p, listen)
@@ -119,7 +123,8 @@ impl Gateway {
         stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let session = Identity::generate();
         let seed = 0x0badc0deu32;
-        let hello = handshake::build_client_hello(&pool.box_pk(), identity, &session, "replay-test/0.1", seed, &[0u8; 16]);
+        let hello =
+            handshake::build_client_hello(&pool.box_pk(), identity, &session, "replay-test/0.1", seed, &[0u8; 16]);
         let mut initial = KeyStream(CLIENT_INITIAL_KEY);
         let mut h = Header::new(cmd::HELLO, hello.len());
         h.sealed = true;
@@ -324,7 +329,11 @@ fn one_share_is_credited_once_no_matter_how_it_is_resubmitted() {
         let mut again = share.clone();
         again.job.as_mut().unwrap().txn_total_weight = if i % 2 == 0 { 4_000_000 } else { 0 };
         let (status, code) = gw.submit(&again);
-        assert_eq!((status, code), (mining::REJECTED, mining::REJECT_DUPLICATE_WORK), "replay #{i} via job-section flip");
+        assert_eq!(
+            (status, code),
+            (mining::REJECTED, mining::REJECT_DUPLICATE_WORK),
+            "replay #{i} via job-section flip"
+        );
     }
     // Same share, no sections at all (cached job)
     let mut bare = share.clone();

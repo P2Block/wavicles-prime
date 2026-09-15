@@ -118,6 +118,15 @@ fn segwit_script(ver: Fe32, prog: &[u8]) -> Vec<u8> {
 /// or `~` (gateway username modifier). A gateway with `stratum_username_mod` resolves
 /// `addr~mod.worker` itself; one without forwards it verbatim, and the pool must not
 /// treat `addr~mod` as an address.
+/// The worker name: what follows the first '.' or '~' in the stratum username ("" if none).
+pub fn worker_of(username: &str) -> &str {
+    let u = username.trim();
+    match u.find(['.', '~']) {
+        Some(i) => &u[i + 1..],
+        None => "",
+    }
+}
+
 pub fn identity_of(username: &str) -> &str {
     let u = username.trim();
     let end = u.find(['.', '~']).unwrap_or(u.len());

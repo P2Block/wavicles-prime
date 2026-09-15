@@ -397,12 +397,13 @@ impl Session {
         } else {
             std::collections::BTreeMap::new()
         };
+        let split_params = self.shared.split_params();
         let (split, target, total_work, miners) = {
             let ledger = self.shared.ledger.lock().unwrap();
             let net = self.shared.network;
-            let s = ledger.window.split_with_carry(value, &self.shared.split_params, &carry_map, |ident| {
-                address::to_script(ident, net)
-            });
+            let s = ledger
+                .window
+                .split_with_carry(value, &split_params, &carry_map, |ident| address::to_script(ident, net));
             (s, ledger.window.target_work(), ledger.window.total_work(), ledger.window.miners())
         };
         let mut outputs: Vec<Output> = Vec::with_capacity(split.payees.len() + 2);
@@ -411,7 +412,7 @@ impl Session {
             let height = self.shared.tip_snapshot().map(|t| t.height + 1).unwrap_or(0);
             let mut ph = prev_hash;
             ph.reverse();
-            let sp = &self.shared.split_params;
+            let sp = &split_params;
             let snap = snapshot::build(
                 &self.shared.cfg.snapshot_tag,
                 height,
@@ -424,6 +425,7 @@ impl Session {
                 sp.max_outputs,
                 sp.output_budget_bytes,
                 sp.max_payees,
+                &sp.fee_overrides,
                 target,
                 total_work,
                 &miners,
@@ -534,6 +536,15 @@ impl Session {
         // output: reject the share as bad-username so the gateway's log tells the miner at once,
         // instead of crediting work whose sats would stay with the pool (2026-09-09: worker names
         // such as "sc184" sent through a pool_pass_full_users gateway).
+        // P2Block: a banned identity's shares are refused (the gateway logs the reject so the
+        // miner sees it), and nothing is credited.
+        if self.shared.controls.read().unwrap().identity_banned(&identity) {
+            if !self.bad_username_warned {
+                self.bad_username_warned = true;
+                log::warn!("[{}] rejecting shares from {identity:?}: identity is banned", self.id);
+            }
+            return self.reject(&s, mining::REJECT_BAD_USERNAME).await;
+        }
         if address::to_script(&identity, self.shared.network).is_none() {
             if !self.bad_username_warned {
                 self.bad_username_warned = true;
@@ -650,6 +661,7 @@ impl Session {
         }
         self.shared.totals.add(&self.shared.totals.accepted, 1);
         self.shared.totals.add(&self.shared.totals.work, v.work);
+        self.shared.credit_worker(&identity, address::worker_of(&s.username), &self.gateway_hex, v.work, ts);
         let kind = v.coinbase_kind.clone();
         self.shared.client_update(self.id, |c| {
             c.accepted += 1;
@@ -684,7 +696,8 @@ impl Session {
             c.rejected += 1;
             c.last_reject = Some(name);
         });
-        self.send_mining(&mining::share_receipt(mining::REJECTED, code, s.nonce32, s.target_pot, s.job_id), false).await?;
+        self.send_mining(&mining::share_receipt(mining::REJECTED, code, s.nonce32, s.target_pot, s.job_id), false)
+            .await?;
         self.note_reject()
     }
 
@@ -760,7 +773,7 @@ impl Session {
                 let ledger = self.shared.ledger.lock().unwrap();
                 let net = self.shared.network;
                 let sp =
-                    ledger.window.split(v.coinbase_value, &self.shared.split_params, |i| address::to_script(i, net));
+                    ledger.window.split(v.coinbase_value, &self.shared.split_params(), |i| address::to_script(i, net));
                 let owed = sp.paid_sats();
                 let list: Vec<(String, u64)> = sp.payees.iter().map(|p| (p.identity.clone(), p.sats)).collect();
                 unpaid_rec.extend(list.iter().cloned());
@@ -791,10 +804,12 @@ impl Session {
 
         // ask for the transactions so we can submit the block ourselves as a backup
         let job = s.job_id;
-        self.pending_blocks
-            .entry(job)
-            .or_default()
-            .push(PendingBlock { share: v, submit: s, hash_hex, at: Instant::now() });
+        self.pending_blocks.entry(job).or_default().push(PendingBlock {
+            share: v,
+            submit: s,
+            hash_hex,
+            at: Instant::now(),
+        });
         self.send_mining(&mining::request_full_block(job), false).await?;
         // every other gateway should refresh its template now
         let _ = self.shared.notify.send(self.id as u32);

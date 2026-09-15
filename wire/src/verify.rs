@@ -757,8 +757,7 @@ mod tests {
         iss.push(Output { sats: VALUE - miners_paid, script: pool.clone() });
 
         // every miner exact, pool output missing, first miner takes the remainder
-        let mut outs: Vec<TxOut> =
-            iss[..3].iter().map(|o| TxOut { value: o.sats, script: o.script.clone() }).collect();
+        let mut outs: Vec<TxOut> = iss[..3].iter().map(|o| TxOut { value: o.sats, script: o.script.clone() }).collect();
         outs[0].value += VALUE - miners_paid;
         let mut slot = JobSlot::default();
         let mut s = share(0, 4, 1, &outs, &txids(3), 1, [0; 8], [0; 8]);
@@ -766,8 +765,7 @@ mod tests {
         assert_eq!(check(&mut slot, &s, &policy(&iss, &pool)), Err(mining::REJECT_BAD_COINBASE_OUTPUTS));
 
         // same with a token pool output present, so "pool_paid" alone cannot be the tell
-        let mut outs: Vec<TxOut> =
-            iss[..3].iter().map(|o| TxOut { value: o.sats, script: o.script.clone() }).collect();
+        let mut outs: Vec<TxOut> = iss[..3].iter().map(|o| TxOut { value: o.sats, script: o.script.clone() }).collect();
         outs[1].value += VALUE - miners_paid - 1_000;
         outs.push(TxOut { value: 1_000, script: pool.clone() });
         let mut slot = JobSlot::default();

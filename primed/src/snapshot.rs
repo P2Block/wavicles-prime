@@ -16,7 +16,7 @@ use serde_json::{json, Map, Value};
 use tides::split::Split;
 use tides::MinerStat;
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2; // 2: params.fee_overrides (P2Block per-identity fees)
 /// Snapshots older than this are pruned (blocks found keep theirs: the site archives them).
 pub const KEEP_SECS: u64 = 48 * 3600;
 
@@ -56,6 +56,7 @@ pub fn build(
     max_outputs: usize,
     output_budget_bytes: usize,
     max_payees: usize,
+    fee_overrides: &BTreeMap<String, u32>,
     window_target: u64,
     window_total: u64,
     miners: &[MinerStat],
@@ -69,16 +70,14 @@ pub fn build(
         .collect();
     window.sort_by(|a, b| a["identity"].as_str().cmp(&b["identity"].as_str()));
     let carry_v: Vec<Value> = carry.iter().map(|(i, s)| json!({ "identity": i, "sats": s })).collect();
+    let overrides: Vec<Value> = fee_overrides.iter().map(|(i, b)| json!({ "identity": i, "fee_bps": b })).collect();
     let payees: Vec<Value> = split
         .payees
         .iter()
         .map(|p| json!({ "identity": p.identity, "work": p.work, "sats": p.sats, "script": hex::encode(&p.script) }))
         .collect();
-    let unpaid: Vec<Value> = split
-        .unpaid
-        .iter()
-        .map(|(i, s, r)| json!({ "identity": i, "sats": s, "reason": format!("{r:?}") }))
-        .collect();
+    let unpaid: Vec<Value> =
+        split.unpaid.iter().map(|(i, s, r)| json!({ "identity": i, "sats": s, "reason": format!("{r:?}") })).collect();
     let carry_paid: Vec<Value> = split.carry_paid.iter().map(|(i, s)| json!({ "identity": i, "sats": s })).collect();
     let doc = json!({
         "v": VERSION,
@@ -94,7 +93,8 @@ pub fn build(
             "max_outputs": max_outputs,
             "output_budget_bytes": output_budget_bytes,
             "max_payees": max_payees,
-            "rule": "sats_i = value * work_i * (10000 - fee_bps) / total_work / 10000 (floor), payees largest work first; carry paid from the remainder above the fee, by identity name; pool = value - sum(paid)",
+            "fee_overrides": overrides,
+            "rule": "sats_i = value * work_i * (10000 - bps_i) / total_work / 10000 (floor) where bps_i = fee_overrides[identity] if present, else stratum_fee_bps for stratum_work and fee_bps for the rest; payees largest work first; carry paid from the remainder above the fee, by identity name; pool = value - sum(paid)",
         },
         "window": { "target_work": window_target, "total_work": window_total, "identities": window },
         "carry": carry_v,

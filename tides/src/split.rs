@@ -30,6 +30,20 @@ pub struct SplitParams {
     /// Identities below the cut get nothing from this block (`BelowCut`); their work stays in
     /// the window. 0 = unlimited (the classic rule: the remainder goes to the pool as carry).
     pub max_payees: usize,
+    /// Per-identity fee in basis points, overriding both `fee_bps` and `stratum_fee_bps` for
+    /// that identity on every path (P2Block: promotions, partners). Empty = nobody overridden.
+    pub fee_overrides: BTreeMap<String, u32>,
+}
+
+impl SplitParams {
+    /// (stratum bps, datum bps) that apply to `identity`.
+    pub fn bps_for(&self, identity: &str) -> (u32, u32) {
+        if let Some(&o) = self.fee_overrides.get(identity) {
+            return (o, o);
+        }
+        let stratum = if self.stratum_fee_bps == 0 { self.fee_bps } else { self.stratum_fee_bps };
+        (stratum, self.fee_bps)
+    }
 }
 
 impl Default for SplitParams {
@@ -41,6 +55,7 @@ impl Default for SplitParams {
             max_outputs: 512,
             output_budget_bytes: 14_000,
             max_payees: 0,
+            fee_overrides: BTreeMap::new(),
         }
     }
 }
@@ -113,24 +128,24 @@ pub fn compute_with_carry(
     carry: &BTreeMap<String, u64>,
     script_for: &mut impl FnMut(&str) -> Option<Vec<u8>>,
 ) -> Split {
-    let stratum_bps = if p.stratum_fee_bps == 0 { p.fee_bps } else { p.stratum_fee_bps };
     let mut fee_sats = 0u64;
     let mut payees = Vec::new();
     let mut unpaid = Vec::new();
     let mut paid = 0u64;
     let mut bytes = 0usize;
-    let mut fee_mix: Vec<(u64, u64)> = Vec::new();   // (stratum_work, datum_work) per miner, for the exact capped fee
+    // Σ_i (stratum_work_i · stratum_bps_i + datum_work_i · datum_bps_i): the exact fee numerator for the
+    // capped split, per-identity so fee overrides are honoured to the sat.
+    let mut fee_num: u128 = 0;
     if total_work > 0 {
         for m in miners {
             let sw = m.stratum_work.min(m.work);
             let dw = m.work - sw;
-            fee_mix.push((sw, dw));
-            let keep = u128::from(sw) * u128::from(10_000 - stratum_bps)
-                + u128::from(dw) * u128::from(10_000 - p.fee_bps);
+            let (sbps, dbps) = p.bps_for(&m.identity);
+            fee_num += u128::from(sw) * u128::from(sbps) + u128::from(dw) * u128::from(dbps);
+            let keep = u128::from(sw) * u128::from(10_000 - sbps) + u128::from(dw) * u128::from(10_000 - dbps);
             let sats = (u128::from(value) * keep / u128::from(total_work) / 10_000) as u64;
             fee_sats = fee_sats.saturating_add(
-                (u128::from(value)
-                    * (u128::from(sw) * u128::from(stratum_bps) + u128::from(dw) * u128::from(p.fee_bps))
+                (u128::from(value) * (u128::from(sw) * u128::from(sbps) + u128::from(dw) * u128::from(dbps))
                     / u128::from(total_work)
                     / 10_000) as u64,
             );
@@ -157,10 +172,7 @@ pub fn compute_with_carry(
     // exactly its fee: no dust, no over-budget leftovers, nothing owed to anyone.
     if p.max_payees > 0 && !payees.is_empty() {
         // exact fee in one expression (no per-miner floors), so pool_sats == fee to the sat
-        let (mut sw_all, mut dw_all) = (0u128, 0u128);
-        for (sw, dw) in fee_mix.iter() { sw_all += u128::from(*sw); dw_all += u128::from(*dw); }
-        fee_sats = (u128::from(value) * (sw_all * u128::from(stratum_bps) + dw_all * u128::from(p.fee_bps))
-            / u128::from(total_work.max(1)) / 10_000) as u64;
+        fee_sats = (u128::from(value) * fee_num / u128::from(total_work.max(1)) / 10_000) as u64;
         payees.sort_by(|a, b| b.work.cmp(&a.work).then_with(|| a.identity.cmp(&b.identity)));
         if payees.len() > p.max_payees {
             for q in payees.split_off(p.max_payees) {
@@ -231,6 +243,32 @@ mod hex_bytes {
 mod tests {
     use super::*;
 
+    #[test]
+    fn fee_override_applies_to_one_identity_on_both_paths() {
+        let mut p = SplitParams {
+            fee_bps: 100,
+            stratum_fee_bps: 200,
+            min_payout: 1,
+            max_outputs: 512,
+            output_budget_bytes: 14_000,
+            max_payees: 0,
+            fee_overrides: BTreeMap::new(),
+        };
+        p.fee_overrides.insert("v".into(), 50);
+        let miners = vec![miner("a", 1000), miner_stratum("b", 1000), miner_stratum("v", 1000)];
+        let s = compute(miners, 3000, 3_000_000, &p, script);
+        let sats = |id: &str| s.payees.iter().find(|q| q.identity == id).unwrap().sats;
+        assert_eq!(sats("a"), 990_000, "datum path at 1%");
+        assert_eq!(sats("b"), 980_000, "stratum path at 2%");
+        assert_eq!(sats("v"), 995_000, "override 0.5% even on the stratum path");
+        assert_eq!(s.fee_sats, 10_000 + 20_000 + 5_000);
+        // capped mode: the exact fee honours the override too
+        let capped = SplitParams { max_payees: 2, ..p.clone() };
+        let s2 = compute(vec![miner("a", 1000), miner_stratum("v", 1000)], 2000, 2_000_000, &capped, script);
+        assert_eq!(s2.fee_sats, 10_000 + 5_000);
+        assert_eq!(s2.pool_sats, 15_000);
+    }
+
     fn miner(id: &str, work: u64) -> MinerStat {
         MinerStat { identity: id.into(), work, stratum_work: 0, credits: 1, last_ts: 0 }
     }
@@ -258,6 +296,7 @@ mod tests {
             max_outputs: 512,
             output_budget_bytes: 14_000,
             max_payees: 0,
+            fee_overrides: BTreeMap::new(),
         };
         let s = compute(miners, 1001, 312_538_966, &p, script);
         assert_eq!(s.fee_sats, 1_562_694);
@@ -276,12 +315,28 @@ mod tests {
     fn unpayable_and_budget() {
         let miners: Vec<MinerStat> =
             (0..20).map(|i| miner(&format!("{}{}", if i == 3 { "bad" } else { "m" }, i), 100)).collect();
-        let p = SplitParams { fee_bps: 0, stratum_fee_bps: 0, min_payout: 1, max_outputs: 5, output_budget_bytes: 14_000 , max_payees: 0};
+        let p = SplitParams {
+            fee_bps: 0,
+            stratum_fee_bps: 0,
+            min_payout: 1,
+            max_outputs: 5,
+            output_budget_bytes: 14_000,
+            max_payees: 0,
+            fee_overrides: BTreeMap::new(),
+        };
         let s = compute(miners, 2000, 1_000_000, &p, script);
         assert_eq!(s.payees.len(), 5);
         assert!(s.unpaid.iter().any(|u| u.2 == UnpaidReason::NoScript));
         assert_eq!(s.unpaid.iter().filter(|u| u.2 == UnpaidReason::OverBudget).count(), 14);
-        let p = SplitParams { fee_bps: 0, stratum_fee_bps: 0, min_payout: 1, max_outputs: 512, output_budget_bytes: 12 * 2 , max_payees: 0};
+        let p = SplitParams {
+            fee_bps: 0,
+            stratum_fee_bps: 0,
+            min_payout: 1,
+            max_outputs: 512,
+            output_budget_bytes: 12 * 2,
+            max_payees: 0,
+            fee_overrides: BTreeMap::new(),
+        };
         let s = compute(vec![miner("a", 1), miner("b", 1), miner("c", 1)], 3, 300, &p, script);
         assert_eq!(s.payees.len(), 2);
         assert_eq!(s.pool_sats, 100);
@@ -304,6 +359,7 @@ mod tests {
             max_outputs: 512,
             output_budget_bytes: 14_000,
             max_payees: 0,
+            fee_overrides: BTreeMap::new(),
         };
         let s = compute(miners, 1000, 10_000_000, &p, script);
         assert_eq!(s.payees[0].identity, "datum");
@@ -316,7 +372,15 @@ mod tests {
 
     #[test]
     fn carry_forward_pays_from_remainder_and_never_exceeds_value() {
-        let p = SplitParams { fee_bps: 40, stratum_fee_bps: 0, min_payout: 546, max_outputs: 512, output_budget_bytes: 14_000 , max_payees: 0};
+        let p = SplitParams {
+            fee_bps: 40,
+            stratum_fee_bps: 0,
+            min_payout: 546,
+            max_outputs: 512,
+            output_budget_bytes: 14_000,
+            max_payees: 0,
+            fee_overrides: BTreeMap::new(),
+        };
         let miners = vec![
             MinerStat { identity: "a".into(), work: 3, stratum_work: 0, credits: 1, last_ts: 0 },
             MinerStat { identity: "b".into(), work: 1, stratum_work: 0, credits: 1, last_ts: 0 },
@@ -358,14 +422,22 @@ mod tests {
     fn max_payees_pays_value_minus_fee_in_full_to_the_largest() {
         let miners: Vec<MinerStat> = (0..20).map(|i| miner(&format!("m{i:02}"), 100 + (20 - i) as u64)).collect();
         let total: u64 = miners.iter().map(|m| m.work).sum();
-        let p = SplitParams { fee_bps: 40, stratum_fee_bps: 0, min_payout: 546, max_outputs: 512, output_budget_bytes: 14_000, max_payees: 14 };
+        let p = SplitParams {
+            fee_bps: 40,
+            stratum_fee_bps: 0,
+            min_payout: 546,
+            max_outputs: 512,
+            output_budget_bytes: 14_000,
+            max_payees: 14,
+            fee_overrides: BTreeMap::new(),
+        };
         let value = 312_517_600u64;
         let s = compute(miners, total, value, &p, script);
         assert_eq!(s.payees.len(), 14);
         assert_eq!(s.unpaid.iter().filter(|u| u.2 == UnpaidReason::BelowCut).count(), 6);
         assert_eq!(s.fee_sats, fee_for(value, 40));
-        assert_eq!(s.paid_sats(), value - s.fee_sats);           // miners get everything but the fee
-        assert_eq!(s.pool_sats, s.fee_sats);                       // the pool gets exactly its fee
+        assert_eq!(s.paid_sats(), value - s.fee_sats); // miners get everything but the fee
+        assert_eq!(s.pool_sats, s.fee_sats); // the pool gets exactly its fee
         assert!(s.payees.windows(2).all(|w| w[0].work >= w[1].work));
         assert!(s.carry_paid.is_empty());
     }

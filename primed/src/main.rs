@@ -5,17 +5,18 @@
 //! found blocks to the node.
 
 mod address;
-mod snapshot;
 mod config;
+mod controls;
 mod node;
 mod rpc;
 mod session;
+mod snapshot;
 mod state;
 mod stats;
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
@@ -244,7 +245,11 @@ fn run(cfg: Config) -> i32 {
     let blocks = block_log.read_all().unwrap_or_default();
     let carry = tides::Carry::open(&cfg.data_dir);
     if carry.total() > 0 {
-        log::info!("carry: {} sats owed to {} identities (paid by the next coinbases)", carry.total(), carry.owed.len());
+        log::info!(
+            "carry: {} sats owed to {} identities (paid by the next coinbases)",
+            carry.total(),
+            carry.owed.len()
+        );
     }
     let snapshot_dir = snapshot::dir_of(&cfg.data_dir);
     if cfg.commit_snapshot {
@@ -256,8 +261,22 @@ fn run(cfg: Config) -> i32 {
 
     let (tip_tx, tip) = watch::channel(None);
     let (notify, _) = broadcast::channel(64);
+    let controls_path = controls::Controls::path(&cfg.data_dir);
+    let controls = match controls::Controls::load(&controls_path) {
+        Ok(Some(c)) => {
+            log::info!("controls: {} ({})", c.summary(), controls_path.display());
+            c
+        }
+        Ok(None) => controls::Controls::default(),
+        Err(e) => {
+            log::error!("controls.json ignored: {e}");
+            controls::Controls::default()
+        }
+    };
     let shared = Arc::new(Shared {
-        split_params: SplitParams {
+        controls: RwLock::new(controls),
+        workers: Mutex::new(Default::default()),
+        base_split: SplitParams {
             fee_bps: cfg.fee_bps,
             stratum_fee_bps: cfg.stratum_fee_bps,
             min_payout: cfg.min_payout,
@@ -266,6 +285,7 @@ fn run(cfg: Config) -> i32 {
             max_outputs: 511,
             output_budget_bytes: 14_000 - 9 - 64,
             max_payees: cfg.max_payees,
+            fee_overrides: Default::default(),
         },
         pool_script,
         pool,
@@ -312,6 +332,7 @@ fn run(cfg: Config) -> i32 {
         tokio::spawn(node::run(shared.clone()));
         tokio::spawn(stats::serve(shared.clone()));
         tokio::spawn(stats::housekeeping(shared.clone()));
+        tokio::spawn(controls_watcher(shared.clone(), controls_path));
 
         let accept = {
             let shared = shared.clone();
@@ -320,6 +341,16 @@ fn run(cfg: Config) -> i32 {
                 loop {
                     match listener.accept().await {
                         Ok((stream, remote)) => {
+                            // P2Block: banned addresses never get a session.
+                            if shared.controls.read().unwrap().ip_banned(remote.ip()) {
+                                shared.totals.add(&shared.totals.connections_refused, 1);
+                                if refused_warned.elapsed() >= std::time::Duration::from_secs(10) {
+                                    refused_warned = Instant::now();
+                                    log::warn!("{remote} refused: banned");
+                                }
+                                drop(stream);
+                                continue;
+                            }
                             // Admit before spawning: a session holds job and coinbase state
                             // for its gateway, so the count of them is the memory bound.
                             let admitted = shared.connections.lock().unwrap().admit(
@@ -370,6 +401,32 @@ fn run(cfg: Config) -> i32 {
         }
         0
     })
+}
+
+/// Re-read `controls.json` every 5 s when its mtime changes. A bad file is logged and ignored;
+/// a deleted file clears the controls.
+async fn controls_watcher(shared: Arc<Shared>, path: std::path::PathBuf) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let current = shared.controls.read().unwrap().mtime;
+        let mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+        if mtime == current {
+            continue;
+        }
+        match controls::Controls::load(&path) {
+            Ok(Some(c)) => {
+                log::info!("controls reloaded: {}", c.summary());
+                *shared.controls.write().unwrap() = c;
+            }
+            Ok(None) => {
+                if current.is_some() {
+                    log::info!("controls.json removed; back to prime.toml fees, no bans");
+                    *shared.controls.write().unwrap() = controls::Controls::default();
+                }
+            }
+            Err(e) => log::error!("controls.json not applied (previous controls stay in force): {e}"),
+        }
+    }
 }
 
 struct ConnectionSlot {

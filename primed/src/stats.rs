@@ -45,7 +45,8 @@ pub fn build(shared: &Shared) -> Value {
 
     // the split a block would pay right now: how the UI shows each miner's expected payout
     let sample_value = 312_500_000u64;
-    let split = w.split(sample_value, &shared.split_params, |i| address::to_script(i, shared.network));
+    let split_params = shared.split_params();
+    let split = w.split(sample_value, &split_params, |i| address::to_script(i, shared.network));
     let payouts: std::collections::HashMap<&str, u64> =
         split.payees.iter().map(|p| (p.identity.as_str(), p.sats)).collect();
     // why an identity gets nothing from the sample split: BelowMinimum (share < min_payout), NoScript
@@ -56,7 +57,7 @@ pub fn build(shared: &Shared) -> Value {
     // The published RULE (Curly 2026-09-09): everyone with work in the window is paid by work, minimum
     // min_payout per identity, the rest pro-rated among them, pool = fee. That is the capped split with
     // an effectively unlimited cap; `payout_sats` above is what the finder's coinbase can carry today.
-    let rule_params = tides::split::SplitParams { max_payees: 100_000, ..shared.split_params.clone() };
+    let rule_params = tides::split::SplitParams { max_payees: 100_000, ..split_params.clone() };
     let rule_split = w.split(sample_value, &rule_params, |i| address::to_script(i, shared.network));
     let rule_sats: std::collections::HashMap<&str, u64> =
         rule_split.payees.iter().map(|p| (p.identity.as_str(), p.sats)).collect();
@@ -79,6 +80,8 @@ pub fn build(shared: &Shared) -> Value {
                 "unpaid_reason": reasons.get(m.identity.as_str()).cloned().unwrap_or_default(),
                 "rule_sats": rule_sats.get(m.identity.as_str()).copied().unwrap_or(0),
                 "payable": payable,
+                "fee_bps": split_params.bps_for(&m.identity).1,
+                "stratum_fee_bps": split_params.bps_for(&m.identity).0,
                 "hashrate_ghs": ghs(rw),
                 "last_share_s": ts.saturating_sub(u64::from(last.max(m.last_ts))),
             })
@@ -126,6 +129,37 @@ pub fn build(shared: &Shared) -> Value {
             .collect()
     };
 
+    // P2Block: per-worker rows (identity.worker) for miners behind their own gateway.
+    let workers: Vec<Value> = {
+        let w = shared.workers.lock().unwrap();
+        let mut v: Vec<Value> = w
+            .iter()
+            .map(|((identity, worker), e)| {
+                let recent_work: u64 = e.recent.iter().map(|(_, wk)| wk).sum();
+                let oldest = e.recent.front().map(|(t, _)| *t).unwrap_or(ts);
+                let span = ts.saturating_sub(oldest).clamp(30, crate::state::WORKER_RATE_S) as f64;
+                json!({
+                    "identity": identity, "worker": worker, "gateway": e.gateway,
+                    "accepted": e.accepted, "work": e.work,
+                    "last_share_s": ts.saturating_sub(e.last_share_ts),
+                    "hashrate_ghs": recent_work as f64 * HASHES_PER_WORK / span / 1e9,
+                })
+            })
+            .collect();
+        v.sort_by(|a, b| {
+            a["identity"].as_str().cmp(&b["identity"].as_str()).then(a["worker"].as_str().cmp(&b["worker"].as_str()))
+        });
+        v
+    };
+    let controls = {
+        let c = shared.controls();
+        json!({
+            "fee_bps": c.fee_bps, "stratum_fee_bps": c.stratum_fee_bps,
+            "fee_overrides": c.fee_overrides, "banned_identities": c.banned_identities.len(), "banned_nets": c.banned_nets.len(),
+            "updated": c.updated,
+        })
+    };
+
     let t = &shared.totals;
     let (seen_shares, seen_heights) = {
         let s = shared.seen.lock().unwrap();
@@ -150,8 +184,10 @@ pub fn build(shared: &Shared) -> Value {
             "script": hex::encode(&shared.pool_script),
             "tag": shared.cfg.coinbase_tag,
             "prime_id": shared.cfg.prime_id,
-            "fee_bps": shared.cfg.fee_bps,
-            "stratum_fee_bps": shared.cfg.stratum_fee_bps,
+            "fee_bps": split_params.fee_bps,
+            "stratum_fee_bps": split_params.stratum_fee_bps,
+            "config_fee_bps": shared.cfg.fee_bps,
+            "config_stratum_fee_bps": shared.cfg.stratum_fee_bps,
             "window_multiple": shared.cfg.window,
             "min_payout": shared.cfg.min_payout,
             "max_payees": shared.cfg.max_payees,
@@ -195,6 +231,8 @@ pub fn build(shared: &Shared) -> Value {
         },
         "clients": clients,
         "gateways": clients.len(),
+        "workers": workers,
+        "controls": controls,
         "connections_open": shared.connections.lock().unwrap().total(),
         "owed": owed,
         "wavicles": {
@@ -279,8 +317,14 @@ pub async fn housekeeping(shared: Arc<Shared>) {
         tokio::time::sleep(Duration::from_secs(5)).await;
         n += 1;
         if shared.cfg.commit_snapshot && n.is_multiple_of(120) {
-            let keep: Vec<String> =
-                shared.blocks.lock().unwrap().iter().filter(|b| !b.snapshot.is_empty()).map(|b| b.snapshot.clone()).collect();
+            let keep: Vec<String> = shared
+                .blocks
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|b| !b.snapshot.is_empty())
+                .map(|b| b.snapshot.clone())
+                .collect();
             crate::snapshot::prune(&shared.snapshot_dir, now(), &keep);
         }
         {
@@ -303,6 +347,9 @@ pub async fn housekeeping(shared: Arc<Shared>) {
         // the case where the tip is briefly ahead of the height gateways are on.
         if let Some(tip) = shared.tip_snapshot() {
             shared.seen.lock().unwrap().prune_below(tip.height.saturating_sub(2));
+        }
+        if n.is_multiple_of(12) {
+            shared.expire_workers(now());
         }
         let dir = shared.cfg.data_dir.clone();
         let stats = build(&shared).to_string();

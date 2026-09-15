@@ -1,14 +1,22 @@
-# Lazarus DATUM Prime (`primed`)
+# P2Block DATUM Prime (`primed`)
 
-The pool side of the DATUM protocol for the BLAKE2b Bitcoin chain, written from scratch.
+The pool side of the DATUM protocol for the BLAKE2b Bitcoin chain (BTCB2), as run by
+**[P2Block](https://p2block.com)** (`datum.p2block.com:28915`, 1 % with your own gateway,
+2 % on the hosted stratum). This is a fork of
+[GaltRanch/wavicles-prime](https://github.com/GaltRanch/wavicles-prime) (PyBLØCK's WAVICLES
+Prime), which is itself Lazarus `primed` plus the window-snapshot commitment and carry-forward
+described below. Everything P2Block added is listed in
+[P2Block modifications](#p2block-modifications); the protocol, the TIDES rule and the gateways
+supported are unchanged, so any stock `datum_gateway` or `ratum-gateway` points at this Prime
+unpatched.
 
 Any stock `datum_gateway` — OCEAN, [CONVOY](https://github.com/CONVOYMining/datum_gateway),
 the BLAKE2b forks by [FlyTheElephant1](https://github.com/FlyTheElephant1/datum_gateway) and
 [iohzrd](https://github.com/iohzrd/datum_gateway), or the packaged
-[StartOS](https://github.com/Retropex/datum-gateway-startos/releases) build — points at this
-Prime, unpatched (see [Supported gateways](#supported-gateways)). The
-gateway's own node builds every block template. The Prime never sees or chooses transactions;
-it does three things:
+[StartOS](https://github.com/Retropex/datum-gateway-startos/releases) build — and
+[ratum-gateway](https://github.com/iohzrd/ratum) point at this Prime (see
+[Supported gateways](#supported-gateways)). The gateway's own node builds every block
+template. The Prime never sees or chooses transactions; it does three things:
 
 1. **Dictates the coinbase.** When a gateway asks for a coinbaser, the Prime answers with the
    current TIDES split of the window: one output per miner, proportional to work, after the pool
@@ -26,32 +34,96 @@ it does three things:
    paid (or, for a stock gateway's pool-only "empty" coinbase, the amount the pool now owes the
    window) is recorded, and the Prime submits the assembled block to its own node too.
 
-## WAVICLES (PyBLØCK fork)
+## P2Block modifications
 
-This tree is the Prime behind **WAVICLES**, PyBLØCK's DATUM pool for Bitcoin-BLAKE2b
-(`b.pyblock.xyz:28915`, fee 0.4 %). It is Lazarus `primed` plus two things that make the TIDES
-split verifiable from the chain and keep the pool from ever holding a balance for anyone:
+Branch `p2block` = upstream `GaltRanch/wavicles-prime` at the pinned commit + the commits below.
+Builds are tagged `p2block-vX.Y.Z`; the pool's `pool-primed` image is built from that tag.
+
+### Runtime controls (`<data-dir>/controls.json`)
+
+The pool's control plane (poolcore, from the `/admin` console) writes this file; the Prime
+re-reads it within 5 s of any change. Nothing here needs a restart.
+
+```json
+{
+  "fee_bps": 100,                       // live DATUM-tier fee; null/absent = prime.toml fee-bps
+  "stratum_fee_bps": 200,               // live hosted-tier fee; null/absent = prime.toml stratum-fee-bps
+  "fee_overrides": { "bc1q…": 50 },     // per payout address, applies on BOTH paths (partners, promotions)
+  "banned_identities": ["bc1q…"],       // every share from these identities is refused, nothing credited
+  "banned_ips": ["203.0.113.9", "198.51.100.0/24"],   // sessions from these addresses are refused at accept
+  "updated": "2026-09-15T04:00:00Z"
+}
+```
+
+Rules: fees are basis points, 0–10000; override keys are canonicalised like usernames (bech32
+lowercased, `.worker` stripped); unknown keys are rejected. A file that fails validation is
+logged and **ignored, keeping the previous controls in force**; a removed file returns to the
+`prime.toml` values with no bans. Every reload is logged with a one-line summary.
+
+### Per-identity fees in the split and in the commitment
+
+`tides::SplitParams` gained `fee_overrides`; `bps_for(identity)` returns the (stratum, datum)
+basis points that apply. The uncapped and the capped ("pay like CHIRP") paths both honour it,
+and the capped fee is computed exactly per identity. The **window snapshot is now v2**:
+`params.fee_overrides` is committed alongside the tier fees and the rule text names it, so a
+block paying someone a different rate is still reproducible from the chain.
+`tools/verify_wavicles_block.py` recomputes v2 snapshots (and applies the hosted-tier rate to
+`stratum_work` on every path, as the Prime does).
+
+### Per-worker stats for DATUM-tier miners
+
+A miner behind their own gateway is one identity to the pool, but the gateway forwards the
+full stratum username. The Prime now keeps `(identity, worker)` counters — accepted, work,
+last share, a 10-minute hashrate — and exposes them as `workers[]` in `stats.json`. Entries
+expire after an hour of silence. The pool's dashboard shows them as per-rig rows next to the
+hosted-tier ones.
+
+### `stats.json` additions
+
+`pool.fee_bps` / `pool.stratum_fee_bps` are the **effective** values (`pool.config_fee_bps` /
+`pool.config_stratum_fee_bps` keep the file values); every `window.miners[]` row carries its
+`fee_bps` / `stratum_fee_bps`; `controls` summarises what is loaded; `workers[]` as above.
+
+### Keeping up with upstream
+
+```bash
+git remote add upstream https://github.com/GaltRanch/wavicles-prime
+git fetch upstream && git rebase upstream/main p2block      # our commits are few and self-contained
+cargo test && cargo fmt --all -- --check
+git tag p2block-vX.Y.Z && git push --force-with-lease origin p2block && git push origin p2block-vX.Y.Z
+```
+
+Then bump `WAVICLES_REF` in the pool repo's `deploy/images/primed/Dockerfile`. Generic pieces
+(the controls file, per-worker stats) are candidates for upstream pull requests; the fee
+override and ban policy are P2Block's.
+
+## WAVICLES (upstream: PyBLØCK)
+
+Upstream is the Prime behind **WAVICLES**, PyBLØCK's DATUM pool. It is Lazarus `primed` plus
+two things that make the TIDES split verifiable from the chain and keep the pool from ever
+holding a balance for anyone (both kept unchanged here):
 
 * **Window-snapshot commitment.** Every coinbaser is computed from a window state; that state
   (identities and work, carry, parameters, the resulting split) is serialized as canonical JSON,
   hashed with BLAKE2b-256, and committed as the first output of the coinbaser:
-  `OP_RETURN "PYBLOCK-TON618" || hash` (zero sats). The snapshot is published at
+  `OP_RETURN <snapshot-tag> || hash` (zero sats). The snapshot is published at
   `/snapshot/<hash>` on the stats port. `tools/verify_wavicles_block.py --height H` checks that
   the block's commitment hashes the published snapshot, recomputes the split from it, and
   compares every output on chain by scriptPubKey. What still rests on the pool is that the
   window reflects the shares gateways really sent; signed share receipts are the next step.
-* **Carry-forward instead of "owed".** What a coinbase could not pay — dust under 546 sats, outputs
-  a gateway's coinbase class dropped, or a block found on an empty window — is recorded per
-  identity in `carry.json` once the block settles and paid by the next coinbases out of the
-  pool's own output, fee included. The pool nets exactly its fee over time and never custodies
-  payouts. `stats.json` exposes it under `wavicles.carry`.
+* **Carry-forward instead of "owed".** What a coinbase could not pay — dust under the minimum
+  payout, outputs a gateway's coinbase class dropped, or a block found on an empty window — is
+  recorded per identity in `carry.json` once the block settles and paid by the next coinbases
+  out of the pool's own output, fee included. The pool nets exactly its fee over time and never
+  custodies payouts. `stats.json` exposes it under `wavicles.carry`.
 
 Config keys: `commit-snapshot`, `snapshot-tag`, `carry-forward` (all on by default). The wire
 format, the gateways supported and the TIDES rule are unchanged; a stock gateway pays the
 OP_RETURN like any other dictated output.
 
 Credit: the Prime itself is [AwokenLazarus/Bitcoin `prime/`](https://github.com/AwokenLazarus/Bitcoin)
-(MIT), used as-is under its license; the changes above are PyBLØCK's.
+(MIT); the WAVICLES changes are PyBLØCK's ([GaltRanch/wavicles-prime](https://github.com/GaltRanch/wavicles-prime));
+the modifications above are P2Block's. All MIT.
 
 ## Layout
 
@@ -90,7 +162,7 @@ An existing `lazarus-prime.toml` loads unchanged (`activation-height`, `verify-s
 `require-split-gateway` are accepted and reported as no longer applying). A data dir the old
 Prime left behind keeps its identity: `lazarus-prime.key` (its 160-byte layout) is read when
 there is no `prime.key`, so the pool pubkey every gateway operator pinned stays the same —
-`primed pubkey` prints it to confirm. Its `ledger.json` is the whole window; import it before
+`primed pubkey` prints it to confirm. (P2Block runs a fresh key; the section is kept for operators migrating an old Prime.) Its `ledger.json` is the whole window; import it before
 the first `run`:
 
 ```bash
@@ -111,7 +183,7 @@ In `datum_gateway_config.json`:
 
 ```json
 "datum": {
-  "pool_host": "stratum.awokenlazarus.xyz",
+  "pool_host": "datum.p2block.com",
   "pool_port": 28915,
   "pool_pubkey": "<output of primed pubkey>",
   "pool_pass_workers": true,
@@ -242,6 +314,7 @@ the window — in `blocks.jsonl`.
 | File | What |
 |------|------|
 | `prime.key` | ed25519 seed ‖ x25519 secret, 0600, generated once (`lazarus-prime.key` is read instead when present) |
+| `controls.json` | P2Block runtime controls (live fees, per-identity overrides, bans), written by the pool's control plane |
 | `credits.bin` | append-only 24-byte credit rows; replayed at start, compacted when the window trims |
 | `identities.txt` | interned identity table (one address per line, index = row id) |
 | `window.json` | window target work and lifetime counters |
@@ -255,13 +328,13 @@ pool UI reads: `pool` (pubkey, fee, window multiple, advertise address, uptime),
 (height, tip hash, difficulty, tip age), `window` (target/total work, fill percent, per-miner
 `work`, `shares`, `hashrate_ghs`, `share_percent`, `payout_sats` at the current reward),
 `clients` (per gateway: generation, user agent, accepted/rejected, last reject reason),
-`blocks`, `owed`, `totals`. `/ledger.json` is the previous Prime's credits view for the UI's
-hashrate graph; `/healthz` returns `ok`.
+`blocks`, `owed`, `totals`, plus P2Block's `workers` and `controls` (see above). `/ledger.json`
+is the previous Prime's credits view for the UI's hashrate graph; `/healthz` returns `ok`.
 
 ## Tests
 
 ```bash
-cargo test                                  # wire (44), tides (11), primed (12)
+cargo test                                  # wire (44), tides (15), primed (16)
 cargo test --release -p primed --test replay_e2e -- --ignored --nocapture   # hostile gateway vs a real primed
 scripts/regtest-e2e.sh convoy               # or fte | iohzrd | startos: real C gateway + real Knots on regtest
 MINER_CMD='...' scripts/regtest-divergence.sh fte   # two nodes with different mempools and tips

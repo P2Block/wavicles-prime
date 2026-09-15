@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use datum_wire::crypto::Identity;
@@ -13,6 +13,7 @@ use tokio::sync::{broadcast, watch};
 
 use crate::address::Network;
 use crate::config::Config;
+use crate::controls::Controls;
 use crate::rpc::Rpc;
 
 pub fn now() -> u64 {
@@ -58,7 +59,6 @@ pub struct ClientInfo {
     pub cb_pool_only: u64,
     #[serde(default)]
     pub cb_foreign: u64,
-
 }
 
 #[derive(Default)]
@@ -187,12 +187,32 @@ impl Connections {
     }
 }
 
+/// P2Block: per-(identity, worker) share accounting for miners behind their own DATUM gateway,
+/// where the pool otherwise only sees the identity. Worker = the part of the stratum username
+/// after the first '.' (empty when the miner sent a bare address).
+#[derive(Clone, Debug, Default)]
+pub struct WorkerStat {
+    pub gateway: String,
+    pub accepted: u64,
+    pub work: u64,
+    pub last_share_ts: u64,
+    /// (ts, work) of recent shares, for a hashrate over the last `WORKER_RATE_S` seconds.
+    pub recent: std::collections::VecDeque<(u64, u64)>,
+}
+pub const WORKER_RATE_S: u64 = 600;
+/// Workers silent this long are dropped from the table.
+pub const WORKER_EXPIRE_S: u64 = 3600;
+
 pub struct Shared {
     pub cfg: Config,
     pub pool: Identity,
     pub pool_script: Vec<u8>,
     pub network: Network,
-    pub split_params: SplitParams,
+    /// Split parameters from `prime.toml`; `split_params()` layers the live controls on top.
+    pub base_split: SplitParams,
+    /// P2Block runtime controls (`controls.json`): live fees, per-identity overrides, bans.
+    pub controls: RwLock<Controls>,
+    pub workers: Mutex<HashMap<(String, String), WorkerStat>>,
     pub ledger: Mutex<Ledger>,
     /// WAVICLES carry-forward ledger (sats owed to identities, paid by later coinbases).
     pub carry: Mutex<tides::Carry>,
@@ -218,6 +238,50 @@ pub struct Shared {
 }
 
 impl Shared {
+    /// The split parameters in force right now: config, with the controls file's fees and
+    /// per-identity overrides applied.
+    pub fn split_params(&self) -> SplitParams {
+        let c = self.controls.read().unwrap();
+        let mut p = self.base_split.clone();
+        if let Some(b) = c.fee_bps {
+            p.fee_bps = b;
+        }
+        if let Some(b) = c.stratum_fee_bps {
+            p.stratum_fee_bps = b;
+        }
+        p.fee_overrides = c.fee_overrides.clone();
+        p
+    }
+
+    pub fn controls(&self) -> Controls {
+        self.controls.read().unwrap().clone()
+    }
+
+    /// Record an accepted share against its worker (P2Block per-worker stats).
+    pub fn credit_worker(&self, identity: &str, worker: &str, gateway: &str, work: u64, ts: u64) {
+        let mut w = self.workers.lock().unwrap();
+        let e = w.entry((identity.to_string(), worker.to_string())).or_default();
+        e.gateway = gateway.to_string();
+        e.accepted += 1;
+        e.work += work;
+        e.last_share_ts = ts;
+        e.recent.push_back((ts, work));
+        while e.recent.front().is_some_and(|(t, _)| ts.saturating_sub(*t) > WORKER_RATE_S) {
+            e.recent.pop_front();
+        }
+    }
+
+    /// Drop workers that have been silent for `WORKER_EXPIRE_S`, and trim their rate windows.
+    pub fn expire_workers(&self, ts: u64) {
+        let mut w = self.workers.lock().unwrap();
+        w.retain(|_, e| ts.saturating_sub(e.last_share_ts) <= WORKER_EXPIRE_S);
+        for e in w.values_mut() {
+            while e.recent.front().is_some_and(|(t, _)| ts.saturating_sub(*t) > WORKER_RATE_S) {
+                e.recent.pop_front();
+            }
+        }
+    }
+
     /// Persist the carry ledger (best effort; logged on failure).
     pub fn save_carry(&self) {
         let c = self.carry.lock().unwrap();
