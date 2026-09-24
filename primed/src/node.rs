@@ -4,7 +4,26 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
+
 use crate::state::{now, Shared, Tip};
+
+/// 2^32: hashes per diff-1 share (share difficulty 1 is target 2^224).
+const HASHES_PER_DIFF1: f64 = 4_294_967_296.0;
+
+/// Network difficulty in diff-1 share units -- the unit TIDES work is counted in.
+///
+/// SHA256d Bitcoin nodes report `difficulty` already relative to the diff-1 target. BTCB2
+/// (Bitcoin BLAKE2b) omits `difficulty` and reports `difficulty_blake2b`, which is
+/// GetBlockProof(bits) = 2^256 / (target + 1): expected *hashes* per block, 2^32 times the
+/// share-unit value. Reading only `difficulty` left the TIDES target at 0 on BTCB2 (window
+/// never trimmed); using `difficulty_blake2b` unconverted would saturate the u64 target.
+pub(crate) fn share_difficulty(info: &Value) -> f64 {
+    if let Some(d) = info.get("difficulty").and_then(Value::as_f64) {
+        return d;
+    }
+    info.get("difficulty_blake2b").and_then(Value::as_f64).map_or(0.0, |d| d / HASHES_PER_DIFF1)
+}
 
 pub async fn run(shared: Arc<Shared>) {
     let period = Duration::from_secs_f64(shared.cfg.poll.max(0.2));
@@ -19,7 +38,7 @@ pub async fn run(shared: Arc<Shared>) {
                 }
                 let height = info.get("blocks").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 let hash = info.get("bestblockhash").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let difficulty = info.get("difficulty").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let difficulty = share_difficulty(&info);
                 let current = shared.tip_snapshot();
                 let changed = current.as_ref().is_none_or(|t| t.hash != hash);
                 if changed {
@@ -128,4 +147,32 @@ fn mark_orphan(shared: &Shared, hash: &str, height: u32, why: &str) {
     }
     log::warn!("block {hash} at {height} {why}");
     shared.update_block(hash, |r| r.kind = format!("orphan:{}", r.kind));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::share_difficulty;
+    use serde_json::json;
+
+    #[test]
+    fn sha256d_difficulty_is_used_as_is() {
+        assert_eq!(share_difficulty(&json!({ "difficulty": 1234.5 })), 1234.5);
+    }
+
+    #[test]
+    fn btcb2_difficulty_is_converted_from_hashes_to_share_units() {
+        // getblockchaininfo at BTCB2 height 973,858 (bits 1900edba)
+        let d = share_difficulty(&json!({ "difficulty_blake2b": 1.986469847209289e19 }));
+        assert!((d - 1.986469847209289e19 / 4_294_967_296.0).abs() < 1.0);
+        // matches the gateway's own job difficulty for the same bits
+        assert!((d - 4_625_110_531.0).abs() / d < 1e-3);
+        // 8x window target fits a u64 (the unconverted value would not)
+        assert!(d * 8.0 < u64::MAX as f64);
+        assert!(1.986469847209289e19 * 8.0 > u64::MAX as f64);
+    }
+
+    #[test]
+    fn missing_difficulty_is_zero() {
+        assert_eq!(share_difficulty(&json!({ "blocks": 1 })), 0.0);
+    }
 }
