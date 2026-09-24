@@ -19,7 +19,7 @@ pub async fn run(shared: Arc<Shared>) {
                 }
                 let height = info.get("blocks").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 let hash = info.get("bestblockhash").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let difficulty = info.get("difficulty").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let difficulty = node_difficulty(&info);
                 let current = shared.tip_snapshot();
                 let changed = current.as_ref().is_none_or(|t| t.hash != hash);
                 if changed {
@@ -128,4 +128,76 @@ fn mark_orphan(shared: &Shared, hash: &str, height: u32, why: &str) {
     }
     log::warn!("block {hash} at {height} {why}");
     shared.update_block(hash, |r| r.kind = format!("orphan:{}", r.kind));
+}
+
+/// Difficulty 1 measured the node's way: the target of bits 0x1d00ffff, `0xffff * 2^208`.
+fn diff1_target() -> f64 {
+    65535.0 * 2f64.powi(208)
+}
+
+/// The tip difficulty in the unit `getblockchaininfo.difficulty` used before Knots 29.4.2.
+/// 29.4.2 omits `difficulty` on a BLAKE2b (header v2) tip and prints `difficulty_blake2b`,
+/// the expected hash count, instead. Read `difficulty` verbatim, else derive it from `bits`
+/// (present on every version), else `difficulty_blake2b / 2^32` scaled to the same unit.
+/// Zero when none of the three is usable; the caller keeps the previous window target then.
+pub fn node_difficulty(info: &serde_json::Value) -> f64 {
+    if let Some(d) = info.get("difficulty").and_then(|v| v.as_f64()) {
+        if d > 0.0 {
+            return d;
+        }
+    }
+    if let Some(d) = info.get("bits").and_then(|v| v.as_str()).and_then(difficulty_from_bits) {
+        return d;
+    }
+    if let Some(work) = info.get("difficulty_blake2b").and_then(|v| v.as_f64()) {
+        if work > 0.0 {
+            return work / 4294967296.0 * (65535.0 / 65536.0);
+        }
+    }
+    log::warn!("node reports no difficulty, bits or difficulty_blake2b; keeping the previous window target");
+    0.0
+}
+
+fn difficulty_from_bits(hex: &str) -> Option<f64> {
+    let bits = u32::from_str_radix(hex, 16).ok()?;
+    let exp = (bits >> 24) as i32;
+    let mantissa = f64::from(bits & 0x00ff_ffff);
+    if mantissa == 0.0 || bits & 0x0080_0000 != 0 || !(1..=32).contains(&exp) {
+        return None;
+    }
+    let target = mantissa * 256f64.powi(exp - 3);
+    let d = diff1_target() / target;
+    (d.is_finite() && d > 0.0).then_some(d)
+}
+
+#[cfg(test)]
+mod difficulty_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn the_field_is_read_verbatim_when_present() {
+        let v = json!({ "difficulty": 3417233412.773893, "bits": "190141c0" });
+        assert_eq!(node_difficulty(&v), 3417233412.773893);
+    }
+
+    #[test]
+    fn knots_29_4_2_tip_is_derived_from_bits_within_a_hundredth_of_a_percent() {
+        // 29.4.2 at bits 190141c0: no "difficulty", difficulty_blake2b = GetBlockProof
+        let v = json!({ "bits": "190141c0", "difficulty_blake2b": 1.4677129705888563e19 });
+        let d = node_difficulty(&v);
+        let rel = (d - 3417233412.77).abs() / 3417233412.77;
+        assert!(rel < 1e-4, "from bits: {d}");
+        let v = json!({ "difficulty_blake2b": 1.4677129705888563e19 });
+        let w = node_difficulty(&v);
+        let rel = (w - d).abs() / d;
+        assert!(rel < 1e-4, "from work: {w} vs bits {d}");
+    }
+
+    #[test]
+    fn bits_1d00ffff_is_difficulty_one_and_garbage_is_zero() {
+        assert!((node_difficulty(&json!({ "bits": "1d00ffff" })) - 1.0).abs() < 1e-9);
+        assert_eq!(node_difficulty(&json!({ "bits": "zz" })), 0.0);
+        assert_eq!(node_difficulty(&json!({})), 0.0);
+    }
 }
